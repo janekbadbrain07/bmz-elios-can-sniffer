@@ -1,0 +1,11 @@
+# Prawdziwe hasła i klucze - NIGDY nie wrzucaj na GitHub
+secrets.yaml
+
+# Katalog roboczy ESPHome (pliki budowania, cache)
+.esphome/
+
+# Pliki systemowe i edytorów
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

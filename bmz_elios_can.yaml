@@ -1,0 +1,1989 @@
+# =============================================================
+# BMZ Elios CAN Sniffer dla ESPHome
+# Autor: badbrain07
+# Licencja: PolyForm Noncommercial 1.0.0 (patrz plik LICENSE)
+# =============================================================
+# =============================================================
+# CHANGELOG
+# v1.2 (2026-09-17) — Fix: sensory "Aktywność Rozbieżność" wisiały
+#                      na stanie "nieznany" w HA, jeśli od startu
+#                      nigdy nie doszło do realnej rozbieżności
+#                      (publish_state() wołany tylko przy zmianie).
+#                      Dodana jednorazowa publikacja stanu "off"
+#                      przy starcie.
+# v1.1 (2026-09-17) — Histereza + debounce dla sensorów aktywności
+#                      falownika (0,08A ON / 0,03A OFF, 8s zwłoki),
+#                      dodany sensor rozbieżności 1C0 vs 38X (30s).
+#                      Dodany sensor wersji firmware (fw_version).
+# v1.0 (bazowa)      — Pierwsza wersja.
+# =============================================================
+
+esphome:
+  name: bmz-elios-can
+  friendly_name: BMZ_Elios_CAN
+  project:
+    name: "badbrain07.bmz_elios_can"
+    version: "1.2"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 115200
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  ap:
+    ssid: "Bmz-Elios-Can Fallback Hotspot"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Europe/Warsaw"
+    servers:
+      - 0.pl.pool.ntp.org
+      - 1.pl.pool.ntp.org
+
+# =============================================================
+# GLOBALS — ring buffer na ramki CAN
+# =============================================================
+globals:
+  - id: g_queue
+    type: uint8_t[1664]
+    restore_value: no
+  - id: g_queue_head
+    type: int
+    initial_value: '0'
+    restore_value: no
+  - id: g_queue_tail
+    type: int
+    initial_value: '0'
+    restore_value: no
+
+  # Heartbeat — ostatnia wartość licznika B6 dla każdego modułu
+  # Aktualizowany przez ramki: 0x10X, 0x14X, 0x18X, 0x1CX, 0x38X, 0x3CX
+  - id: g_hb_last
+    type: uint8_t[4]
+    restore_value: no
+  - id: g_hb_time
+    type: uint32_t[4]
+    restore_value: no
+
+# =============================================================
+# SENSORY ANALOGOWE (NAPIĘCIA, PRĄDY, TEMP, SOC)
+# =============================================================
+sensor:
+
+  # -----------------------------------------------------------
+  # ENCJE ZBIORCZE (SYSTEMOWE)
+  # -----------------------------------------------------------
+  - platform: template
+    name: "System SOC"
+    id: sys_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+
+  - platform: template
+    name: "System Moc Całkowita"
+    id: sys_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - or:
+          - delta: 5.0
+          - throttle: 10s
+
+  - platform: template
+    name: "System Prąd Całkowity"
+    id: sys_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+
+  - platform: template
+    name: "System Napięcie Średnie"
+    id: sys_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+
+  - platform: template
+    name: "System Max Delta"
+    id: sys_max_delta
+    unit_of_measurement: "mV"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:battery-alert"
+
+  # -----------------------------------------------------------
+  # MODUŁ 1 SENSORS
+  # -----------------------------------------------------------
+  - platform: template
+    name: "Moduł 1 SOC"
+    id: m1_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Prąd 1CX"
+    id: m1_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Prąd 38X"
+    id: m1_current_38x
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Koszyk Prądu B5"
+    id: m1_current_bucket_38x
+    icon: "mdi:stairs"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 1 Napięcie"
+    id: m1_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Moc"
+    id: m1_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - or:
+          - delta: 5.0
+          - throttle: 10s
+  - platform: template
+    name: "Moduł 1 Delta Cel"
+    id: m1_delta
+    unit_of_measurement: "mV"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:battery-alert"
+  - platform: template
+    name: "Moduł 1 Vmin"
+    id: m1_vmin
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Vmax"
+    id: m1_vmax
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura"
+    id: m1_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Min"
+    id: m1_temp_min
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Max"
+    id: m1_temp_max
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Delta"
+    id: m1_temp_delta
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 1"
+    id: m1_temp1
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 2"
+    id: m1_temp2
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 3"
+    id: m1_temp3
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 4"
+    id: m1_temp4
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 5"
+    id: m1_temp5
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Temperatura Czujnik 6"
+    id: m1_temp6
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Moduł 1 Ogniwo 01"
+    id: m1_c1
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 02"
+    id: m1_c2
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 03"
+    id: m1_c3
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 04"
+    id: m1_c4
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 05"
+    id: m1_c5
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 06"
+    id: m1_c6
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 07"
+    id: m1_c7
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 08"
+    id: m1_c8
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 09"
+    id: m1_c9
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 10"
+    id: m1_c10
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 11"
+    id: m1_c11
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 12"
+    id: m1_c12
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 13"
+    id: m1_c13
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 14"
+    id: m1_c14
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 15"
+    id: m1_c15
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 1 Ogniwo 16"
+    id: m1_c16
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+
+  # -----------------------------------------------------------
+  # MODUŁ 2 SENSORS
+  # -----------------------------------------------------------
+  - platform: template
+    name: "Moduł 2 SOC"
+    id: m2_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Prąd 1CX"
+    id: m2_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Prąd 38X"
+    id: m2_current_38x
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Koszyk Prądu B5"
+    id: m2_current_bucket_38x
+    icon: "mdi:stairs"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 2 Napięcie"
+    id: m2_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Moc"
+    id: m2_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - or:
+          - delta: 5.0
+          - throttle: 10s
+  - platform: template
+    name: "Moduł 2 Delta Cel"
+    id: m2_delta
+    unit_of_measurement: "mV"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:battery-alert"
+  - platform: template
+    name: "Moduł 2 Vmin"
+    id: m2_vmin
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Vmax"
+    id: m2_vmax
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura"
+    id: m2_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Min"
+    id: m2_temp_min
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Max"
+    id: m2_temp_max
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Delta"
+    id: m2_temp_delta
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 1"
+    id: m2_temp1
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 2"
+    id: m2_temp2
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 3"
+    id: m2_temp3
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 4"
+    id: m2_temp4
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 5"
+    id: m2_temp5
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Temperatura Czujnik 6"
+    id: m2_temp6
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 01"
+    id: m2_c1
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 02"
+    id: m2_c2
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 03"
+    id: m2_c3
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 04"
+    id: m2_c4
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 05"
+    id: m2_c5
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 06"
+    id: m2_c6
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 07"
+    id: m2_c7
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 08"
+    id: m2_c8
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 09"
+    id: m2_c9
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 10"
+    id: m2_c10
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 11"
+    id: m2_c11
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 12"
+    id: m2_c12
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 13"
+    id: m2_c13
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 14"
+    id: m2_c14
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 15"
+    id: m2_c15
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 2 Ogniwo 16"
+    id: m2_c16
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+
+  # -----------------------------------------------------------
+  # MODUŁ 3 SENSORS
+  # -----------------------------------------------------------
+  - platform: template
+    name: "Moduł 3 SOC"
+    id: m3_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Prąd 1CX"
+    id: m3_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Prąd 38X"
+    id: m3_current_38x
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Koszyk Prądu B5"
+    id: m3_current_bucket_38x
+    icon: "mdi:stairs"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 3 Napięcie"
+    id: m3_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Moc"
+    id: m3_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - or:
+          - delta: 5.0
+          - throttle: 10s
+  - platform: template
+    name: "Moduł 3 Delta Cel"
+    id: m3_delta
+    unit_of_measurement: "mV"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:battery-alert"
+  - platform: template
+    name: "Moduł 3 Vmin"
+    id: m3_vmin
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Vmax"
+    id: m3_vmax
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura"
+    id: m3_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Min"
+    id: m3_temp_min
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Max"
+    id: m3_temp_max
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Delta"
+    id: m3_temp_delta
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 1"
+    id: m3_temp1
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 2"
+    id: m3_temp2
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 3"
+    id: m3_temp3
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 4"
+    id: m3_temp4
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 5"
+    id: m3_temp5
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Temperatura Czujnik 6"
+    id: m3_temp6
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 01"
+    id: m3_c1
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 02"
+    id: m3_c2
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 03"
+    id: m3_c3
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 04"
+    id: m3_c4
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 05"
+    id: m3_c5
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 06"
+    id: m3_c6
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 07"
+    id: m3_c7
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 08"
+    id: m3_c8
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 09"
+    id: m3_c9
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 10"
+    id: m3_c10
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 11"
+    id: m3_c11
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 12"
+    id: m3_c12
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 13"
+    id: m3_c13
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 14"
+    id: m3_c14
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 15"
+    id: m3_c15
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 3 Ogniwo 16"
+    id: m3_c16
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+
+  # -----------------------------------------------------------
+  # MODUŁ 4 SENSORS
+  # -----------------------------------------------------------
+  - platform: template
+    name: "Moduł 4 SOC"
+    id: m4_soc
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Prąd 1CX"
+    id: m4_current
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Prąd 38X"
+    id: m4_current_38x
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Koszyk Prądu B5"
+    id: m4_current_bucket_38x
+    icon: "mdi:stairs"
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 4 Napięcie"
+    id: m4_voltage
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Moc"
+    id: m4_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - or:
+          - delta: 5.0
+          - throttle: 10s
+  - platform: template
+    name: "Moduł 4 Delta Cel"
+    id: m4_delta
+    unit_of_measurement: "mV"
+    accuracy_decimals: 1
+    state_class: measurement
+    icon: "mdi:battery-alert"
+  - platform: template
+    name: "Moduł 4 Vmin"
+    id: m4_vmin
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Vmax"
+    id: m4_vmax
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura"
+    id: m4_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Min"
+    id: m4_temp_min
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Max"
+    id: m4_temp_max
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Delta"
+    id: m4_temp_delta
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 1"
+    id: m4_temp1
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 2"
+    id: m4_temp2
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 3"
+    id: m4_temp3
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 4"
+    id: m4_temp4
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 5"
+    id: m4_temp5
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Temperatura Czujnik 6"
+    id: m4_temp6
+    unit_of_measurement: "°C"
+    accuracy_decimals: 0
+    device_class: temperature
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 01"
+    id: m4_c1
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 02"
+    id: m4_c2
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 03"
+    id: m4_c3
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 04"
+    id: m4_c4
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 05"
+    id: m4_c5
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 06"
+    id: m4_c6
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 07"
+    id: m4_c7
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 08"
+    id: m4_c8
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 09"
+    id: m4_c9
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 10"
+    id: m4_c10
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 11"
+    id: m4_c11
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 12"
+    id: m4_c12
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 13"
+    id: m4_c13
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 14"
+    id: m4_c14
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 15"
+    id: m4_c15
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Moduł 4 Ogniwo 16"
+    id: m4_c16
+    unit_of_measurement: "V"
+    accuracy_decimals: 3
+    device_class: voltage
+    state_class: measurement
+
+text_sensor:
+  - platform: template
+    name: "Moduł 1 Status"
+    id: m1_status
+  - platform: template
+    name: "Moduł 2 Status"
+    id: m2_status
+  - platform: template
+    name: "Moduł 3 Status"
+    id: m3_status
+  - platform: template
+    name: "Moduł 4 Status"
+    id: m4_status
+
+  # --- Wersja firmware (patrz CHANGELOG na górze pliku) ---
+  - platform: template
+    name: "Wersja Firmware"
+    id: fw_version
+    icon: "mdi:tag-outline"
+    entity_category: diagnostic
+    lambda: |-
+      return {"v1.2 (2026-09-17)"};
+
+# =============================================================
+# BINARY SENSORS — STATUS BALANSOWANIA OGNIW
+# =============================================================
+
+binary_sensor:
+  # --- Heartbeat ---
+  - platform: template
+    name: "Moduł 1 Heartbeat"
+    id: m1_heartbeat
+    device_class: connectivity
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moduł 2 Heartbeat"
+    id: m2_heartbeat
+    device_class: connectivity
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moduł 3 Heartbeat"
+    id: m3_heartbeat
+    device_class: connectivity
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moduł 4 Heartbeat"
+    id: m4_heartbeat
+    device_class: connectivity
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Moduł 1 Falownik Aktywny"
+    id: m1_inverter_active
+    device_class: running
+  - platform: template
+    name: "Moduł 2 Falownik Aktywny"
+    id: m2_inverter_active
+    device_class: running
+  - platform: template
+    name: "Moduł 3 Falownik Aktywny"
+    id: m3_inverter_active
+    device_class: running
+  - platform: template
+    name: "Moduł 4 Falownik Aktywny"
+    id: m4_inverter_active
+    device_class: running
+
+  # --- Falownik Aktywny (wersja z ramki 0x38X, dokładniejszy odczyt prądu) ---
+  - platform: template
+    name: "Moduł 1 Falownik Aktywny 38X"
+    id: m1_inverter_active_38x
+    device_class: running
+  - platform: template
+    name: "Moduł 2 Falownik Aktywny 38X"
+    id: m2_inverter_active_38x
+    device_class: running
+  - platform: template
+    name: "Moduł 3 Falownik Aktywny 38X"
+    id: m3_inverter_active_38x
+    device_class: running
+  - platform: template
+    name: "Moduł 4 Falownik Aktywny 38X"
+    id: m4_inverter_active_38x
+    device_class: running
+
+  # --- Rozbieżność między dwiema wersjami sensora aktywności (1C0 vs 38X) ---
+  # Włącza się, gdy "Falownik Aktywny" i "Falownik Aktywny 38X" różnią się
+  # przez dłużej niż 30 s — diagnostyka: podejrzenie problemu z jedną z
+  # ramek CAN (0x1C0 / 0x380) albo z jednym z torów pomiaru prądu.
+  - platform: template
+    name: "Moduł 1 Aktywność Rozbieżność"
+    id: m1_activity_mismatch
+    device_class: problem
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 2 Aktywność Rozbieżność"
+    id: m2_activity_mismatch
+    device_class: problem
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 3 Aktywność Rozbieżność"
+    id: m3_activity_mismatch
+    device_class: problem
+    entity_category: diagnostic
+  - platform: template
+    name: "Moduł 4 Aktywność Rozbieżność"
+    id: m4_activity_mismatch
+    device_class: problem
+    entity_category: diagnostic
+
+  # --- Moduł 1 Balansowanie ---
+  - platform: template
+    name: "Moduł 1 Ogniwo 01 Balansowanie"
+    id: m1_bal_1
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 02 Balansowanie"
+    id: m1_bal_2
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 03 Balansowanie"
+    id: m1_bal_3
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 04 Balansowanie"
+    id: m1_bal_4
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 05 Balansowanie"
+    id: m1_bal_5
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 06 Balansowanie"
+    id: m1_bal_6
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 07 Balansowanie"
+    id: m1_bal_7
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 08 Balansowanie"
+    id: m1_bal_8
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 09 Balansowanie"
+    id: m1_bal_9
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 10 Balansowanie"
+    id: m1_bal_10
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 11 Balansowanie"
+    id: m1_bal_11
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 12 Balansowanie"
+    id: m1_bal_12
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 13 Balansowanie"
+    id: m1_bal_13
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 14 Balansowanie"
+    id: m1_bal_14
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 15 Balansowanie"
+    id: m1_bal_15
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 1 Ogniwo 16 Balansowanie"
+    id: m1_bal_16
+    icon: "mdi:scale-balance"
+
+  # --- Moduł 2 Balansowanie ---
+  - platform: template
+    name: "Moduł 2 Ogniwo 01 Balansowanie"
+    id: m2_bal_1
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 02 Balansowanie"
+    id: m2_bal_2
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 03 Balansowanie"
+    id: m2_bal_3
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 04 Balansowanie"
+    id: m2_bal_4
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 05 Balansowanie"
+    id: m2_bal_5
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 06 Balansowanie"
+    id: m2_bal_6
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 07 Balansowanie"
+    id: m2_bal_7
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 08 Balansowanie"
+    id: m2_bal_8
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 09 Balansowanie"
+    id: m2_bal_9
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 10 Balansowanie"
+    id: m2_bal_10
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 11 Balansowanie"
+    id: m2_bal_11
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 12 Balansowanie"
+    id: m2_bal_12
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 13 Balansowanie"
+    id: m2_bal_13
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 14 Balansowanie"
+    id: m2_bal_14
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 15 Balansowanie"
+    id: m2_bal_15
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 2 Ogniwo 16 Balansowanie"
+    id: m2_bal_16
+    icon: "mdi:scale-balance"
+
+  # --- Moduł 3 Balansowanie ---
+  - platform: template
+    name: "Moduł 3 Ogniwo 01 Balansowanie"
+    id: m3_bal_1
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 02 Balansowanie"
+    id: m3_bal_2
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 03 Balansowanie"
+    id: m3_bal_3
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 04 Balansowanie"
+    id: m3_bal_4
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 05 Balansowanie"
+    id: m3_bal_5
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 06 Balansowanie"
+    id: m3_bal_6
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 07 Balansowanie"
+    id: m3_bal_7
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 08 Balansowanie"
+    id: m3_bal_8
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 09 Balansowanie"
+    id: m3_bal_9
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 10 Balansowanie"
+    id: m3_bal_10
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 11 Balansowanie"
+    id: m3_bal_11
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 12 Balansowanie"
+    id: m3_bal_12
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 13 Balansowanie"
+    id: m3_bal_13
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 14 Balansowanie"
+    id: m3_bal_14
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 15 Balansowanie"
+    id: m3_bal_15
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 3 Ogniwo 16 Balansowanie"
+    id: m3_bal_16
+    icon: "mdi:scale-balance"
+
+  # --- Moduł 4 Balansowanie ---
+  - platform: template
+    name: "Moduł 4 Ogniwo 01 Balansowanie"
+    id: m4_bal_1
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 02 Balansowanie"
+    id: m4_bal_2
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 03 Balansowanie"
+    id: m4_bal_3
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 04 Balansowanie"
+    id: m4_bal_4
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 05 Balansowanie"
+    id: m4_bal_5
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 06 Balansowanie"
+    id: m4_bal_6
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 07 Balansowanie"
+    id: m4_bal_7
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 08 Balansowanie"
+    id: m4_bal_8
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 09 Balansowanie"
+    id: m4_bal_9
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 10 Balansowanie"
+    id: m4_bal_10
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 11 Balansowanie"
+    id: m4_bal_11
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 12 Balansowanie"
+    id: m4_bal_12
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 13 Balansowanie"
+    id: m4_bal_13
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 14 Balansowanie"
+    id: m4_bal_14
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 15 Balansowanie"
+    id: m4_bal_15
+    icon: "mdi:scale-balance"
+  - platform: template
+    name: "Moduł 4 Ogniwo 16 Balansowanie"
+    id: m4_bal_16
+    icon: "mdi:scale-balance"
+
+# =============================================================
+# CANBUS — tryb LISTENONLY, wszystkie ramki do kolejki
+# =============================================================
+canbus:
+  - platform: esp32_can
+    id: can_bus_bmz
+    tx_pin:
+      number: GPIO5
+      ignore_strapping_warning: true
+    rx_pin: GPIO4
+    can_id: 0x000
+    bit_rate: 500kbps
+    mode: LISTENONLY
+    rx_queue_len: 128
+    tx_queue_len: 16
+
+    on_frame:
+      - can_id: 0x000
+        can_id_mask: 0x000
+        then:
+          - lambda: |-
+              int next_tail = (id(g_queue_tail) + 1) % 128;
+              if (next_tail == id(g_queue_head)) return; // kolejka pełna
+              int slot = id(g_queue_tail) * 13;
+              id(g_queue)[slot+0] = (can_id >> 24) & 0xFF;
+              id(g_queue)[slot+1] = (can_id >> 16) & 0xFF;
+              id(g_queue)[slot+2] = (can_id >>  8) & 0xFF;
+              id(g_queue)[slot+3] = (can_id      ) & 0xFF;
+              int dlen = (int)x.size();
+              if (dlen > 8) dlen = 8;
+              id(g_queue)[slot+4] = (uint8_t)dlen;
+              for (int i = 0; i < dlen; i++) id(g_queue)[slot+5+i] = x[i];
+              for (int i = dlen; i < 8; i++) id(g_queue)[slot+5+i] = 0x00;
+              id(g_queue_tail) = next_tail;
+
+# =============================================================
+# INTERVAL 50ms — przetwarzanie kolejki i dekodowanie ramek
+# =============================================================
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          // --- Tablice wskaźników do sensorów analogowych ---
+          static template_::TemplateSensor* cells[4][16] = {
+            { id(m1_c1),id(m1_c2),id(m1_c3),id(m1_c4),id(m1_c5),id(m1_c6),id(m1_c7),id(m1_c8),
+              id(m1_c9),id(m1_c10),id(m1_c11),id(m1_c12),id(m1_c13),id(m1_c14),id(m1_c15),id(m1_c16) },
+            { id(m2_c1),id(m2_c2),id(m2_c3),id(m2_c4),id(m2_c5),id(m2_c6),id(m2_c7),id(m2_c8),
+              id(m2_c9),id(m2_c10),id(m2_c11),id(m2_c12),id(m2_c13),id(m2_c14),id(m2_c15),id(m2_c16) },
+            { id(m3_c1),id(m3_c2),id(m3_c3),id(m3_c4),id(m3_c5),id(m3_c6),id(m3_c7),id(m3_c8),
+              id(m3_c9),id(m3_c10),id(m3_c11),id(m3_c12),id(m3_c13),id(m3_c14),id(m3_c15),id(m3_c16) },
+            { id(m4_c1),id(m4_c2),id(m4_c3),id(m4_c4),id(m4_c5),id(m4_c6),id(m4_c7),id(m4_c8),
+              id(m4_c9),id(m4_c10),id(m4_c11),id(m4_c12),id(m4_c13),id(m4_c14),id(m4_c15),id(m4_c16) }
+          };
+
+          // --- Tablica wskaźników do sensorów binarnych balansowania ---
+          static binary_sensor::BinarySensor* cell_bals[4][16] = {
+            { id(m1_bal_1),id(m1_bal_2),id(m1_bal_3),id(m1_bal_4),id(m1_bal_5),id(m1_bal_6),id(m1_bal_7),id(m1_bal_8),
+              id(m1_bal_9),id(m1_bal_10),id(m1_bal_11),id(m1_bal_12),id(m1_bal_13),id(m1_bal_14),id(m1_bal_15),id(m1_bal_16) },
+            { id(m2_bal_1),id(m2_bal_2),id(m2_bal_3),id(m2_bal_4),id(m2_bal_5),id(m2_bal_6),id(m2_bal_7),id(m2_bal_8),
+              id(m2_bal_9),id(m2_bal_10),id(m2_bal_11),id(m2_bal_12),id(m2_bal_13),id(m2_bal_14),id(m2_bal_15),id(m2_bal_16) },
+            { id(m3_bal_1),id(m3_bal_2),id(m3_bal_3),id(m3_bal_4),id(m3_bal_5),id(m3_bal_6),id(m3_bal_7),id(m3_bal_8),
+              id(m3_bal_9),id(m3_bal_10),id(m3_bal_11),id(m3_bal_12),id(m3_bal_13),id(m3_bal_14),id(m3_bal_15),id(m3_bal_16) },
+            { id(m4_bal_1),id(m4_bal_2),id(m4_bal_3),id(m4_bal_4),id(m4_bal_5),id(m4_bal_6),id(m4_bal_7),id(m4_bal_8),
+              id(m4_bal_9),id(m4_bal_10),id(m4_bal_11),id(m4_bal_12),id(m4_bal_13),id(m4_bal_14),id(m4_bal_15),id(m4_bal_16) }
+          };
+
+          static template_::TemplateSensor* voltages[4]  = { id(m1_voltage), id(m2_voltage), id(m3_voltage), id(m4_voltage) };
+          static template_::TemplateSensor* currents[4]  = { id(m1_current), id(m2_current), id(m3_current), id(m4_current) };
+          static template_::TemplateSensor* currents_38x[4] = { id(m1_current_38x), id(m2_current_38x), id(m3_current_38x), id(m4_current_38x) };
+          static template_::TemplateSensor* buckets_38x[4] = { id(m1_current_bucket_38x), id(m2_current_bucket_38x), id(m3_current_bucket_38x), id(m4_current_bucket_38x) };
+          static binary_sensor::BinarySensor* inv_act_38x[4] = { id(m1_inverter_active_38x), id(m2_inverter_active_38x), id(m3_inverter_active_38x), id(m4_inverter_active_38x) };
+          static template_::TemplateSensor* powers[4]    = { id(m1_power),   id(m2_power),   id(m3_power),   id(m4_power)   };
+          static template_::TemplateSensor* socs[4]      = { id(m1_soc),     id(m2_soc),     id(m3_soc),     id(m4_soc)     };
+          static template_::TemplateSensor* deltas[4]    = { id(m1_delta),   id(m2_delta),   id(m3_delta),   id(m4_delta)   };
+          static template_::TemplateSensor* vmins[4]     = { id(m1_vmin),    id(m2_vmin),    id(m3_vmin),    id(m4_vmin)    };
+          static template_::TemplateSensor* vmaxs[4]     = { id(m1_vmax),    id(m2_vmax),    id(m3_vmax),    id(m4_vmax)    };
+          // cell_min_idxs i cell_max_idxs usunięte — wartości z B4/B5 ramki 0x14X są nieprawidłowe
+          static template_::TemplateSensor* temps[4]     = { id(m1_temp),    id(m2_temp),    id(m3_temp),    id(m4_temp)    };
+          static template_::TemplateSensor* tmins[4]     = { id(m1_temp_min),id(m2_temp_min),id(m3_temp_min),id(m4_temp_min) };
+          static template_::TemplateSensor* tmaxs[4]     = { id(m1_temp_max),id(m2_temp_max),id(m3_temp_max),id(m4_temp_max) };
+          static template_::TemplateSensor* tdeltas[4]   = { id(m1_temp_delta),id(m2_temp_delta),id(m3_temp_delta),id(m4_temp_delta) };
+          static template_::TemplateSensor* temp_sensors[4][6] = {
+            { id(m1_temp1),id(m1_temp2),id(m1_temp3),id(m1_temp4),id(m1_temp5),id(m1_temp6) },
+            { id(m2_temp1),id(m2_temp2),id(m2_temp3),id(m2_temp4),id(m2_temp5),id(m2_temp6) },
+            { id(m3_temp1),id(m3_temp2),id(m3_temp3),id(m3_temp4),id(m3_temp5),id(m3_temp6) },
+            { id(m4_temp1),id(m4_temp2),id(m4_temp3),id(m4_temp4),id(m4_temp5),id(m4_temp6) }
+          };
+          static text_sensor::TextSensor*   statuses[4]  = { id(m1_status),  id(m2_status),  id(m3_status),  id(m4_status)  };
+          static binary_sensor::BinarySensor* heartbeats[4] = { id(m1_heartbeat), id(m2_heartbeat), id(m3_heartbeat), id(m4_heartbeat) };
+          static binary_sensor::BinarySensor* inv_act[4] = { id(m1_inverter_active),id(m2_inverter_active),id(m3_inverter_active),id(m4_inverter_active) };
+
+          static uint32_t last_seen[4]    = {0, 0, 0, 0};
+          static float last_voltage[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
+          static float last_current[4]    = {0.0f, 0.0f, 0.0f, 0.0f};
+          static float last_soc[4]        = {0.0f, 0.0f, 0.0f, 0.0f};
+          static float last_delta[4]      = {0.0f, 0.0f, 0.0f, 0.0f};
+
+          // -----------------------------------------------------------
+          // AKTYWNOŚĆ FALOWNIKA — histereza + zwłoka czasowa (debounce)
+          // Bez tego, przy bardzo małym prądzie (np. moduł prawie
+          // naładowany), wartość "skacze" wokół pojedynczego progu i
+          // stan on/off migocze co kilka sekund. Dwa niezależne liczniki
+          // (dla wersji 1C0 i 38X), żeby móc je nadal porównywać.
+          // -----------------------------------------------------------
+          static const float    ACT_ON_THRESHOLD     = 0.08f;   // próg włączenia [A]
+          static const float    ACT_OFF_THRESHOLD    = 0.03f;   // próg wyłączenia [A]
+          static const uint32_t ACT_DEBOUNCE_MS       = 8000;    // 8 s
+          static const uint32_t MISMATCH_DEBOUNCE_MS   = 30000;   // 30 s
+
+          static bool     act38_out[4]         = {false, false, false, false}; // opublikowany stan (38X)
+          static bool     act38_cand[4]        = {false, false, false, false}; // kandydat na nowy stan
+          static uint32_t act38_since[4]       = {0, 0, 0, 0};                 // od kiedy kandydat stabilny
+
+          static bool     act_out[4]           = {false, false, false, false}; // opublikowany stan (1C0, historyczny)
+          static bool     act_cand[4]          = {false, false, false, false};
+          static uint32_t act_since[4]         = {0, 0, 0, 0};
+
+          static bool     act_mismatch_out[4]    = {false, false, false, false};
+          static bool     act_mismatch_cand[4]   = {false, false, false, false};
+          static uint32_t act_mismatch_since[4]  = {0, 0, 0, 0};
+
+          static binary_sensor::BinarySensor* act_mismatch[4] = {
+            id(m1_activity_mismatch), id(m2_activity_mismatch),
+            id(m3_activity_mismatch), id(m4_activity_mismatch)
+          };
+
+          uint32_t now = millis();
+
+          // Jednorazowa publikacja stanu początkowego sensorów rozbieżności —
+          // bez tego, jeśli od startu nigdy nie dojdzie do realnej rozbieżności,
+          // encja zostaje bez opublikowanej wartości ("nieznany" w HA zamiast "off").
+          static bool mismatch_initialized = false;
+          if (!mismatch_initialized) {
+            mismatch_initialized = true;
+            for (int i = 0; i < 4; i++) {
+              act_mismatch[i]->publish_state(false);
+            }
+          }
+
+          // Aktualizuje jeden sensor aktywności z histerezą + debounce.
+          // out_state  — aktualnie opublikowany (odfiltrowany) stan
+          // cand_state — "kandydat" na nowy stan, jeszcze niepotwierdzony czasowo
+          // since      — moment (millis) od którego cand_state jest stabilny
+          auto update_activity = [&](float value, bool &out_state, bool &cand_state,
+                                      uint32_t &since, binary_sensor::BinarySensor* sensor) {
+            bool above_on  = (value > ACT_ON_THRESHOLD) || (value < -ACT_ON_THRESHOLD);
+            bool below_off = (value > -ACT_OFF_THRESHOLD) && (value < ACT_OFF_THRESHOLD);
+
+            bool new_candidate = cand_state;
+            if (!out_state && above_on) new_candidate = true;
+            else if (out_state && below_off) new_candidate = false;
+
+            if (new_candidate != cand_state) {
+              cand_state = new_candidate;
+              since = now;
+            }
+
+            if (cand_state != out_state && (now - since >= ACT_DEBOUNCE_MS)) {
+              out_state = cand_state;
+              sensor->publish_state(out_state);
+            }
+          };
+
+          // --- Przetwarzanie kolejki ring-buffer ---
+          while (id(g_queue_head) != id(g_queue_tail)) {
+            int slot = id(g_queue_head) * 13;
+            uint32_t cid = ((uint32_t)id(g_queue)[slot+0] << 24)
+                         | ((uint32_t)id(g_queue)[slot+1] << 16)
+                         | ((uint32_t)id(g_queue)[slot+2] <<  8)
+                         | ((uint32_t)id(g_queue)[slot+3]      );
+            id(g_queue_head) = (id(g_queue_head) + 1) % 128;
+
+            uint8_t d[8];
+            for (int i = 0; i < 8; i++) d[i] = id(g_queue)[slot+5+i];
+
+            uint8_t mod = cid & 0x000F;
+            if (mod < 1 || mod > 4) continue;
+            int m = mod - 1;
+
+            uint32_t base_id = cid & 0xFFF0;
+
+            // Heartbeat — aktualizuj gdy ramka zawiera licznik B6
+            // Ramki z licznikiem: 0x10X, 0x14X, 0x18X, 0x1CX, 0x38X, 0x3CX
+            // UWAGA: logika OR — g_hb_last[m] jest WSPÓLNY dla wszystkich 6 typów
+            // ramek danego modułu (nie ma osobnego licznika per typ ramki).
+            // Wystarczy, że DOWOLNA z tych sześciu ramek przyjdzie z innym B6
+            // niż ostatnio zapisane (z dowolnej z nich) — moduł jest "połączony".
+            // To NIE wykrywa sytuacji, w której jeden konkretny typ ramki ucichł,
+            // a pozostałe pięć nadal chodzi — świadoma decyzja projektowa,
+            // bo taka częściowa awaria jest bardzo mało prawdopodobna.
+            if (base_id == 0x100 || base_id == 0x140 || base_id == 0x180 ||
+                base_id == 0x1C0 || base_id == 0x380 || base_id == 0x3C0) {
+              uint8_t cnt = d[6];
+              if (cnt != id(g_hb_last)[m]) {
+                id(g_hb_last)[m] = cnt;
+                id(g_hb_time)[m] = now;
+                heartbeats[m]->publish_state(true);
+              }
+            }
+            last_seen[m] = now;
+
+            // 0x1CX — SOC + prąd
+            if (base_id == 0x1C0) {
+              int16_t raw_cur = (int16_t)(((uint16_t)d[1] << 8) | d[0]);
+              float cur = raw_cur * 0.01f;
+              float soc = (float)d[4];
+              currents[m]->publish_state(cur);
+              socs[m]->publish_state(soc);
+              last_current[m] = cur;
+              last_soc[m] = soc;
+              if (last_voltage[m] > 0.0f)
+                powers[m]->publish_state(last_voltage[m] * cur);
+            }
+
+            // 0x3CX — napięcie pakietu
+            else if (base_id == 0x3C0) {
+              uint16_t raw_v = ((uint16_t)d[1] << 8) | d[0];
+              float f_v = raw_v / 1000.0f;
+              if (f_v > 40.0f && f_v < 62.0f) {
+                voltages[m]->publish_state(f_v);
+                last_voltage[m] = f_v;
+                powers[m]->publish_state(f_v * last_current[m]);
+              }
+            }
+
+            // 0x14X — Vmin i Vmax ogniwa
+            // B0-B1: Vmin, B2-B3: Vmax — uint16 LE / 1000 = V
+            // UWAGA: brak maski 0x0FFF — ramka 0x14X nie zawiera bitu balansowania
+            // B4-B5: numery ogniw — interpretacja niepotwierdzona (pojawia się wartość 17
+            //         dla 16-ogniwowego modułu) — publikujemy bez walidacji jako diagnostyczne
+            else if (base_id == 0x140) {
+              uint16_t raw_min = ((uint16_t)d[1] << 8) | d[0];
+              uint16_t raw_max = ((uint16_t)d[3] << 8) | d[2];
+              float f_min = raw_min / 1000.0f;
+              float f_max = raw_max / 1000.0f;
+              if (f_min > 2.0f && f_max < 4.0f) {
+                float delta_mv = (f_max - f_min) * 1000.0f;
+                deltas[m]->publish_state(delta_mv);
+                last_delta[m] = delta_mv;
+                vmins[m]->publish_state(f_min);
+                vmaxs[m]->publish_state(f_max);
+                // B4/B5 — numery ogniw min/max: interpretacja niepotwierdzona
+                // Kolega stwierdził wartości spoza zakresu 1-16 (np. 17, 129)
+                // Sensory usunięte — dane nieprawidłowe
+              }
+            }
+
+            // ---------------------------------------------------------
+            // 0x20X, 0x24X, 0x28X, 0x2CX — NAPIĘCIA OGNIW 1-16 + BALANSOWANIE
+            // ---------------------------------------------------------
+            else if (base_id >= 0x200 && base_id <= 0x2C0) {
+              int cell_start = ((base_id - 0x200) / 0x40) * 4;
+              for (int i = 0; i < 4; i++) {
+                uint16_t raw = ((uint16_t)d[i*2+1] << 8) | d[i*2];
+                
+                // Maska 0x0FFF do wyciągnięcia samego napięcia
+                float v = (raw & 0x0FFF) / 1000.0f; 
+                
+                // Bit 15 (0x8000) oznacza aktywne balansowanie na tym ogniwie
+                bool is_balancing = (raw & 0x8000) != 0; 
+
+                int c_idx = cell_start + i;
+                if (v > 2.5f && v < 3.8f) {
+                  cells[m][c_idx]->publish_state(v);
+                  cell_bals[m][c_idx]->publish_state(is_balancing);
+                }
+              }
+            }
+
+            // 0x30X — czujniki temperatury: 6 pojedynczych czujników na moduł
+            // (zawsze obecnych w tej ramce). Min/maks/delta liczy sam BMS i
+            // publikuje w ramce 0x18X (patrz niżej) — tutaj tylko średnia
+            // i osobne encje diagnostyczne per czujnik.
+            else if (base_id == 0x300) {
+              float sum = 0.0f;
+              for (int i = 0; i < 6; i++) {
+                float t = (float)d[i];
+                sum += t;
+                if (t >= 0.0f && t <= 80.0f) {
+                  temp_sensors[m][i]->publish_state(t);
+                }
+              }
+              temps[m]->publish_state(sum / 6.0f);
+            }
+
+            // 0x18X — BMS już liczy min/maks/deltę temperatur, więc
+            // wykorzystujemy to zamiast liczyć samodzielnie z 0x30X.
+            // B0 = temp max, B2 = temp min, B4 = delta (max - min).
+            else if (base_id == 0x180) {
+              float t_max = (float)d[0];
+              float t_min = (float)d[2];
+              float t_del = (float)d[4];
+              if (t_max >= 0.0f && t_max <= 80.0f) tmaxs[m]->publish_state(t_max);
+              if (t_min >= 0.0f && t_min <= 80.0f) tmins[m]->publish_state(t_min);
+              if (t_del >= 0.0f && t_del <= 80.0f) tdeltas[m]->publish_state(t_del);
+            }
+
+            // 0x0CX — status BMS
+            // B0=0x01 = normalny. B3.bit0 = aktywna flaga błędu wewnętrznego BMS
+            // Potwierdzone: 0x0C1: 00 00 80 01 = błąd, 00 00 80 00 = po błędzie
+            // Histerezy błędu nierównowagi: alarm ~80mV, reset ~40mV
+            else if (base_id == 0x0C0) {
+              bool b3_error = (d[3] & 0x01) != 0;
+              const char* s = (d[0] == 0x01 && !b3_error) ? "OK" :
+                              b3_error ? "ALARM_B3" : "ALARM";
+              statuses[m]->publish_state(s);
+            }
+
+            // 0x38X — prąd chwilowy z ramki falownika + licznik watchdog
+            else if (base_id == 0x380) {
+              // Prąd: B3-B4, 16-bit signed, Big Endian, skala 0.0004 A/LSB
+              int16_t raw_cur38 = (int16_t)(((uint16_t)d[3] << 8) | d[4]);
+              float cur38 = raw_cur38 * 0.0004f;
+              currents_38x[m]->publish_state(cur38);
+
+              // Licznik B6 (uint8, rośnie o 1 co ramkę, modulo 256, ~1/s) —
+              // używany tylko wewnętrznie do heartbeatu (patrz wyżej), bez
+              // osobnej encji diagnostycznej.
+              // B7 = CRC-8/SAE-J1850 obliczone z bajtów B0-B6 — pomijamy
+
+              // B5 — zgrubny "koszyk" prądu, redundantny wobec B3-B4.
+              // Odpowiada górnemu niblowi B3 (z rozszerzeniem znaku),
+              // czyli RAW >> 12 (rozdzielczość ~1,638 A/koszyk).
+              int8_t bucket38 = (int8_t)d[5];
+              buckets_38x[m]->publish_state((float)bucket38);
+
+              // Aktywność falownika — wersja oparta o dokładniejszy odczyt z 0x38X
+              // (histereza 0,08 A ON / 0,03 A OFF + zwłoka 8 s — patrz update_activity wyżej)
+              update_activity(cur38, act38_out[m], act38_cand[m], act38_since[m], inv_act_38x[m]);
+
+              // Aktywność falownika — wersja historyczna, oparta o prąd z 0x1C0
+              // (ta sama logika histerezy/zwłoki, ale niezależny licznik/stan)
+              update_activity(last_current[m], act_out[m], act_cand[m], act_since[m], inv_act[m]);
+
+              // --- Sensor rozbieżności między obiema (już odfiltrowanymi) wersjami ---
+              // Jeśli różnią się dłużej niż 30 s — podejrzenie problemu z jedną z
+              // ramek CAN (0x1C0 / 0x380) albo z jednym z torów pomiaru prądu.
+              bool raw_mismatch = (act38_out[m] != act_out[m]);
+              if (raw_mismatch != act_mismatch_cand[m]) {
+                act_mismatch_cand[m] = raw_mismatch;
+                act_mismatch_since[m] = now;
+              }
+              if (act_mismatch_cand[m] != act_mismatch_out[m] &&
+                  (now - act_mismatch_since[m] >= MISMATCH_DEBOUNCE_MS)) {
+                act_mismatch_out[m] = act_mismatch_cand[m];
+                act_mismatch[m]->publish_state(act_mismatch_out[m]);
+              }
+            }
+
+
+            // 0x10X — bitmapa balansowania ogniw (B3+B4 Little Endian)
+            // Potwierdzone: zgadza się bit po bicie z flagą 0x8000 w ramkach napięć ogniw
+            // Używana jako drugie źródło weryfikacji balansowania obok bitu 0x8000
+            else if (base_id == 0x100) {
+              // bal_map: B3 | (B4 << 8) — Little Endian, bity 0-15 = ogniwa C1-C16
+              uint16_t bal_map = (uint16_t)d[3] | ((uint16_t)d[4] << 8);
+              for (int i = 0; i < 16; i++) {
+                bool is_bal = (bal_map & (1 << i)) != 0;
+                cell_bals[m][i]->publish_state(is_bal);
+              }
+              // B1.bit1 i B1.bit3 — dodatkowe flagi błędu podczas błędu BMS
+              bool b1_err = ((d[1] & 0x02) != 0) || ((d[1] & 0x08) != 0);
+              if (b1_err) {
+                statuses[m]->publish_state("ALARM_10X_B1");
+              }
+            }
+
+          } // koniec while kolejki
+
+          // --- Watchdog heartbeat: 3s bez zmiany licznika B6 → OFFLINE ---
+          for (int i = 0; i < 4; i++) {
+            if (id(g_hb_time)[i] > 0 && (now - id(g_hb_time)[i] > 3000)) {
+              heartbeats[i]->publish_state(false);
+            }
+          }
+
+          // --- Watchdog: 10s bez ramki → NAN / OFF ---
+          for (int i = 0; i < 4; i++) {
+            if (last_seen[i] > 0 && (now - last_seen[i] > 10000)) {
+              socs[i]->publish_state(NAN);
+              voltages[i]->publish_state(NAN);
+              currents[i]->publish_state(NAN);
+              powers[i]->publish_state(NAN);
+              deltas[i]->publish_state(NAN);
+              vmins[i]->publish_state(NAN);
+              vmaxs[i]->publish_state(NAN);
+              // cell_min/max_idx usunięte
+              temps[i]->publish_state(NAN);
+              tmins[i]->publish_state(NAN);
+              tmaxs[i]->publish_state(NAN);
+              for (int c = 0; c < 16; c++) {
+                cells[i][c]->publish_state(NAN);
+                cell_bals[i][c]->publish_state(false);
+              }
+              statuses[i]->publish_state("ODŁĄCZONY");
+              heartbeats[i]->publish_state(false);
+              inv_act[i]->publish_state(false);
+              currents_38x[i]->publish_state(NAN);
+              buckets_38x[i]->publish_state(NAN);
+              inv_act_38x[i]->publish_state(false);
+              act_mismatch[i]->publish_state(false);
+              last_seen[i] = 0;
+              last_voltage[i] = 0.0f;
+              last_current[i] = 0.0f;
+              last_soc[i] = 0.0f;
+              last_delta[i] = 0.0f;
+
+              // Reset stanu histerezy/debounce — po ponownym połączeniu
+              // decyzje mają liczyć się od nowa, a nie ze stanu sprzed rozłączenia.
+              act38_out[i] = false;    act38_cand[i] = false;    act38_since[i] = 0;
+              act_out[i]   = false;    act_cand[i]   = false;    act_since[i]   = 0;
+              act_mismatch_out[i] = false; act_mismatch_cand[i] = false; act_mismatch_since[i] = 0;
+            }
+          }
+
+          // --- AGREGACJA DANYCH SYSTEMOWYCH ---
+          float sys_pwr_sum = 0.0f;
+          float sys_cur_sum = 0.0f;
+          float sys_v_sum = 0.0f;
+          float sys_soc_sum = 0.0f;
+          float sys_max_d = 0.0f;
+          int active_modules = 0;
+
+          for (int i = 0; i < 4; i++) {
+            if (last_seen[i] > 0) {
+              active_modules++;
+              sys_pwr_sum += (last_voltage[i] * last_current[i]);
+              sys_cur_sum += last_current[i];
+              sys_v_sum += last_voltage[i];
+              sys_soc_sum += last_soc[i];
+              if (last_delta[i] > sys_max_d) {
+                sys_max_d = last_delta[i];
+              }
+            }
+          }
+
+          if (active_modules > 0) {
+            id(sys_power)->publish_state(sys_pwr_sum);
+            id(sys_current)->publish_state(sys_cur_sum);
+            id(sys_voltage)->publish_state(sys_v_sum / active_modules);
+            id(sys_soc)->publish_state(sys_soc_sum / active_modules);
+            id(sys_max_delta)->publish_state(sys_max_d);
+          } else {
+            id(sys_power)->publish_state(NAN);
+            id(sys_current)->publish_state(NAN);
+            id(sys_voltage)->publish_state(NAN);
+            id(sys_soc)->publish_state(NAN);
+            id(sys_max_delta)->publish_state(NAN);
+          }
